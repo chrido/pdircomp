@@ -1,13 +1,20 @@
+extern crate pbr;
 extern crate argparse;
 extern crate crossbeam;
 extern crate ring;
+
+use std::fmt;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, Result, Read, Write, BufWriter};
+use std::ffi::OsString;
 
 use std::fs::{self};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Arc};
 
-use crossbeam::channel::{Sender};
-use crossbeam::channel::{unbounded};
+use crossbeam::channel::Sender;
+use crossbeam::channel::unbounded;
 use crossbeam::thread;
 use argparse::{ArgumentParser, StoreTrue, Store};
 
@@ -15,11 +22,9 @@ use ring::digest::{Context, Digest, SHA256};
 
 use data_encoding::HEXUPPER;
 
-use std::fmt;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Result, Read, Write, BufWriter};
-use std::ffi::{OsString};
+use pbr::ProgressBar;
+
+use rand::seq::SliceRandom;
 
 #[derive(Copy, Clone, PartialEq)]
 enum DirSide {
@@ -56,7 +61,7 @@ fn sha256_digest(path: PathBuf) -> Result<Digest> {
 
 struct HashTask {
     side: DirSide,
-    path: PathBuf
+    path: PathBuf,
 }
 
 fn visit_dirs(path_sender: Sender<Option<HashTask>>, side: DirSide, dir: &Path) -> Result<()> {
@@ -67,7 +72,7 @@ fn visit_dirs(path_sender: Sender<Option<HashTask>>, side: DirSide, dir: &Path) 
             if path_loc.is_dir() {
                 visit_dirs(path_sender.clone(), side, path_loc.as_path())?;
             } else {
-                path_sender.send(Some(HashTask {side: side, path: entry.path()})).unwrap();
+                path_sender.send(Some(HashTask { side: side, path: entry.path() })).unwrap();
             }
         }
     }
@@ -85,24 +90,23 @@ fn write_missing(matching: &HashMap<OsString, HashResult>, side: DirSide) -> std
     let mut buf_writer_missing = BufWriter::new(missing_left);
     matching.iter()
         .filter(|&(_k, v)| v.side != side)
-        .for_each(|(_k, v)| { writeln!(&mut buf_writer_missing, "missing {}: {}", side, v.path.display()).unwrap()}); //TODO! write errors are not handled
+        .for_each(|(_k, v)| { writeln!(&mut buf_writer_missing, "missing {}: {}", side, v.path.display()).unwrap() }); //TODO! write errors are not handled
     buf_writer_missing.flush()?;
 
     Ok(())
 }
 
 fn write_results(matching: &HashMap<OsString, HashResult>, missmatches: Vec<(HashResult, HashResult)>) -> std::io::Result<()> {
-
     let mismatched_file = File::create("mismatched.txt")?;
     let mut buf_writer_mismatch_file = BufWriter::new(mismatched_file);
 
     for (first, second) in missmatches {
-        let first_path_os = first.path.into_os_string();
-        let second_path_os = second.path.into_os_string();
+        let first_path_os = first.path.into_os_string().into_string().unwrap_or("error".to_string());
+        let second_path_os = second.path.into_os_string().into_string().unwrap_or("error".to_string());
         if first.side == DirSide::Left {
-            writeln!(&mut buf_writer_mismatch_file, "mismatch: {} - {} left: {} - right: {}", first_path_os.to_string_lossy(), second_path_os.to_string_lossy(), first.hash, second.hash)?;
+            writeln!(&mut buf_writer_mismatch_file, "mismatch: {} - {} left: {} - right: {}", first_path_os, second_path_os, first.hash, second.hash)?;
         } else {
-            writeln!(&mut buf_writer_mismatch_file, "mismatch: {} - {} left: {} - right: {}", second_path_os.to_string_lossy(), first_path_os.to_string_lossy(), second.hash, first.hash)?;
+            writeln!(&mut buf_writer_mismatch_file, "mismatch: {} - {} left: {} - right: {}", second_path_os, first_path_os, second.hash, first.hash)?;
         }
     }
     buf_writer_mismatch_file.flush()?;
@@ -118,15 +122,15 @@ fn write_results(matching: &HashMap<OsString, HashResult>, missmatches: Vec<(Has
 struct HashResult {
     side: DirSide,
     path: PathBuf,
-    hash: String
+    hash: String,
 }
 
 fn main() {
     let mut verbose = false;
 
-    let mut dir_left:String = String::from("None");
-    let mut dir_right:String = String::from("None");
-    let mut total_threads:usize = 2;
+    let mut dir_left: String = String::from("None");
+    let mut dir_right: String = String::from("None");
+    let mut total_threads: usize = 2;
 
     {  // this block limits scope of borrows by ap.refer() method
         let mut ap = ArgumentParser::new();
@@ -154,7 +158,6 @@ fn main() {
         //if total_threads < 1 {
         //    todo!("to less threads, validation");
         //}
-
     }
 
 
@@ -163,16 +166,19 @@ fn main() {
 
     let source_paths = vec![(DirSide::Left, Path::new(str_dir_left)), (DirSide::Right, Path::new(str_dir_right))];
 
+
+    //Scanning ot directories
     thread::scope(|s| {
         let walking_finished = Arc::new(Mutex::new(0));
-        let (tx_paths_to_check, receiver_paths_to_check) = unbounded();
+        let (tx_walked_paths, rx_walked_paths) = unbounded();
 
         for (side, base_dir) in source_paths {
-            let tx_first = tx_paths_to_check.clone();
-            let tx_second = tx_paths_to_check.clone();
+            let tx_first = tx_walked_paths.clone();
+            let tx_second = tx_walked_paths.clone();
             let walking_finished_cnt = walking_finished.clone();
             s.spawn(move |_| {
                 visit_dirs(tx_first, side, base_dir).unwrap();
+                println!("Finished walking {}", side);
                 let mut num = walking_finished_cnt.lock().unwrap();
                 *num += 1;
                 if *num > 1 {
@@ -180,6 +186,34 @@ fn main() {
                 }
             });
         }
+
+        let (tx_max_count, rx_max_count) = unbounded();
+        let (tx_paths_to_check, receiver_paths_to_check) = unbounded();
+        //let rx_first = receiver_paths_to_check.clone();
+        s.spawn(move |_| {
+            let mut all_hashtasks:Vec<HashTask> = vec![];
+
+            //Receive all until cancellation
+            while let Ok(Some(ht)) = rx_walked_paths.recv() {
+                all_hashtasks.push(ht);
+            }
+
+
+            //shuffle
+            let mut rng = rand::thread_rng();
+            all_hashtasks.shuffle(&mut rng);
+
+            println!("Start comparing files:");
+            tx_max_count.send(all_hashtasks.len() as u64);
+
+            //Send
+            while let Some(ht) = all_hashtasks.pop() {
+                tx_paths_to_check.send(Some(ht));
+            }
+
+            //CancellationToken
+            tx_paths_to_check.send(None);
+        });
 
         let (tx_hashresults, rx_resultmerger) = unbounded();
         for _ in 0..total_threads {
@@ -199,8 +233,12 @@ fn main() {
 
         s.spawn(move |_| {
             let mut cnt_cancellation_tokens_received = 1;
-            let mut matching:HashMap<OsString, HashResult> = HashMap::new();
-            let mut notmatched:Vec<(HashResult, HashResult)> = Vec::new();
+            let mut matching: HashMap<OsString, HashResult> = HashMap::new();
+            let mut notmatched: Vec<(HashResult, HashResult)> = Vec::new();
+
+            let mut pb = ProgressBar::new(rx_max_count.recv().unwrap());
+            //pb.format("╢▌▌░╟");
+
 
             while let Ok(o_hr) = rx_resultmerger.recv() {
                 match o_hr {
@@ -217,11 +255,6 @@ fn main() {
                                     Some(_hr_other) => { //It's already one time here
                                         let hr_other_side = matching.remove(&path_os).unwrap();
                                         if hr_other_side.hash != hr.hash {
-                                            if hr.side == DirSide::Left {
-                                                println!("mismatch: {} left: {} - right: {}", path_os.to_string_lossy(), hr.hash, hr_other_side.hash);
-                                            } else {
-                                                println!("mismatch: {} left: {} - right: {}", path_os.to_string_lossy(), hr_other_side.hash, hr.hash);
-                                            }
                                             notmatched.push((hr, hr_other_side));
                                         }
                                     }
@@ -234,21 +267,33 @@ fn main() {
                                 todo!();
                             }
                         }
+                        pb.inc();
                     }
                     None => {
-                        cnt_cancellation_tokens_received +=1;
+                        cnt_cancellation_tokens_received += 1;
                         if cnt_cancellation_tokens_received > total_threads {
                             if matching.len() == 0 && notmatched.len() == 0 {
                                 println!("Directories exactly the same!");
                             } else {
-
                                 match write_results(&matching, notmatched) {
                                     Err(e) => println!("Failed writing results! {}", e),
                                     Ok(_) => println!("Results written!")
                                 }
 
+                                /*
+                                notmatched.iter().for_each(|(hr, hr_other_side)| {
+                                    let pa = hr.path.into_os_string().into_string().unwrap_or("error".to_string());
+                                    if hr.side == DirSide::Left {
+                                        println!("mismatch: {} left: {} - right: {}", pa, hr.hash, hr_other_side.hash);
+                                    } else {
+                                        println!("mismatch: {} left: {} - right: {}", pa, hr_other_side.hash, hr.hash);
+                                    }
+                                });
+                                */
+
                                 //then print&store missing left
-                                matching.iter()
+
+                                /*matching.iter()
                                     .filter(|&(_k, v)| v.side == DirSide::Right)
                                     .for_each(|(_k, v)| { println!("missing left: {}", v.path.display()) });
 
@@ -257,7 +302,7 @@ fn main() {
                                     .filter(|&(_k, v)| v.side == DirSide::Left)
                                     .for_each(|(_k, v)| { println!("missing right: {}", v.path.display()) });
 
-
+                                */
                                 println!("finished processing");
                             }
                             break;
