@@ -1,5 +1,5 @@
-extern crate pbr;
-extern crate argparse;
+extern crate indicatif;
+extern crate clap;
 extern crate crossbeam;
 extern crate ring;
 
@@ -12,17 +12,19 @@ use std::ffi::OsString;
 use std::fs::{self};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Arc};
+use std::time::Duration;
 
 use crossbeam::channel::Sender;
 use crossbeam::channel::unbounded;
 use crossbeam::thread;
-use argparse::{ArgumentParser, StoreTrue, Store};
+
+use clap::{Arg, App, SubCommand};
 
 use ring::digest::{Context, Digest, SHA256};
 
 use data_encoding::HEXUPPER;
 
-use pbr::ProgressBar;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use rand::seq::SliceRandom;
 
@@ -79,7 +81,7 @@ fn visit_dirs(path_sender: Sender<Option<HashTask>>, side: DirSide, dir: &Path) 
     Ok(())
 }
 
-fn send_cancellation_tokens(path_sender: Sender<Option<HashTask>>, thread_count: usize) {
+fn send_cancellation_tokens(path_sender: Sender<Option<HashTask>>, thread_count: i32) {
     for _ in 0..thread_count {
         path_sender.send(None).unwrap();
     }
@@ -126,46 +128,45 @@ struct HashResult {
 }
 
 fn main() {
-    let mut verbose = false;
+    let matches = App::new("Parallel directory compare")
+        .version("0.0.1")
+        .author("Christoph Doblander")
+        .about("Compares the content of two directories")
+        .arg(Arg::with_name("v")
+            .short("v")
+            .multiple(true)
+            .help("Sets the level of verbosity"))
+        .arg(Arg::with_name("left")
+            .short("l")
+            .long("left")
+            .value_name("LEFT_DIRECTORY")
+            .help("Sets the left directory")
+            .takes_value(true))
+        .arg(Arg::with_name("right")
+            .short("r")
+            .long("right")
+            .value_name("RIGHT_DIRECTORY")
+            .help("Sets the right directory")
+            .takes_value(true))
+        .arg(Arg::with_name("cores")
+            .short("t")
+            .long("threads")
+            .value_name("THREAD_COUNT")
+            .help("Sets how many threads should be used for hashing")
+            .takes_value(true))
+        .get_matches();
 
-    let mut dir_left: String = String::from("None");
-    let mut dir_right: String = String::from("None");
-    let mut total_threads: usize = 2;
+    let mut verbose = matches.is_present("v");
 
-    {  // this block limits scope of borrows by ap.refer() method
-        let mut ap = ArgumentParser::new();
-        {
-            ap.set_description("Compares the content of two directories");
-            ap.refer(&mut verbose)
-                .add_option(&["-v", "--verbose"], StoreTrue,
-                            "Be verbose");
-            ap.refer(&mut dir_left)
-                .add_option(&["-l", "--left"], Store,
-                            "Left Directory")
-                .required();
-            ap.refer(&mut dir_right)
-                .add_option(&["-r", "--right"], Store,
-                            "Right Directory")
-                .required();
-
-            ap.refer(&mut total_threads)
-                .add_option(&["-c", "--cores"], Store,
-                            "Total amount of threads to be used for checking the content of the file, > 0");
-
-            ap.parse_args_or_exit();
-        }
-
-        //if total_threads < 1 {
-        //    todo!("to less threads, validation");
-        //}
-    }
+    let mut dir_left: String = String::from(matches.value_of("LEFT_DIRECTORY").unwrap());
+    let mut dir_right: String = String::from(matches.value_of("RIGHT_DIRECTORY").unwrap());
+    let mut total_threads: i32 = matches.value_of("THREAD_COUNT").unwrap().parse().unwrap();
 
 
     let str_dir_left = dir_left.as_str();
     let str_dir_right = dir_right.as_str();
 
     let source_paths = vec![(DirSide::Left, Path::new(str_dir_left)), (DirSide::Right, Path::new(str_dir_right))];
-
 
     //Scanning ot directories
     thread::scope(|s| {
@@ -176,6 +177,7 @@ fn main() {
             let tx_first = tx_walked_paths.clone();
             let tx_second = tx_walked_paths.clone();
             let walking_finished_cnt = walking_finished.clone();
+
             s.spawn(move |_| {
                 visit_dirs(tx_first, side, base_dir).unwrap();
                 println!("Finished walking {}", side);
@@ -189,7 +191,6 @@ fn main() {
 
         let (tx_max_count, rx_max_count) = unbounded();
         let (tx_paths_to_check, receiver_paths_to_check) = unbounded();
-        //let rx_first = receiver_paths_to_check.clone();
         s.spawn(move |_| {
             let mut all_hashtasks:Vec<HashTask> = vec![];
 
@@ -197,7 +198,6 @@ fn main() {
             while let Ok(Some(ht)) = rx_walked_paths.recv() {
                 all_hashtasks.push(ht);
             }
-
 
             //shuffle
             let mut rng = rand::thread_rng();
@@ -211,7 +211,7 @@ fn main() {
                 tx_paths_to_check.send(Some(ht));
             }
 
-            //CancellationToken
+            //Send CancellationToken
             tx_paths_to_check.send(None);
         });
 
@@ -236,8 +236,10 @@ fn main() {
             let mut matching: HashMap<OsString, HashResult> = HashMap::new();
             let mut notmatched: Vec<(HashResult, HashResult)> = Vec::new();
 
-            let mut pb = ProgressBar::new(rx_max_count.recv().unwrap());
-            //pb.format("╢▌▌░╟");
+            let pb = ProgressBar::new(rx_max_count.recv().unwrap());
+            pb.set_style(ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:70.cyan/blue}] {pos:>9}/{len:9} ({eta})")
+                .progress_chars("#>-"));
 
 
             while let Ok(o_hr) = rx_resultmerger.recv() {
@@ -267,11 +269,12 @@ fn main() {
                                 todo!();
                             }
                         }
-                        pb.inc();
+                        pb.inc(1);
                     }
                     None => {
                         cnt_cancellation_tokens_received += 1;
                         if cnt_cancellation_tokens_received > total_threads {
+                            pb.finish_with_message("writing results...");
                             if matching.len() == 0 && notmatched.len() == 0 {
                                 println!("Directories exactly the same!");
                             } else {
@@ -279,30 +282,6 @@ fn main() {
                                     Err(e) => println!("Failed writing results! {}", e),
                                     Ok(_) => println!("Results written!")
                                 }
-
-                                /*
-                                notmatched.iter().for_each(|(hr, hr_other_side)| {
-                                    let pa = hr.path.into_os_string().into_string().unwrap_or("error".to_string());
-                                    if hr.side == DirSide::Left {
-                                        println!("mismatch: {} left: {} - right: {}", pa, hr.hash, hr_other_side.hash);
-                                    } else {
-                                        println!("mismatch: {} left: {} - right: {}", pa, hr_other_side.hash, hr.hash);
-                                    }
-                                });
-                                */
-
-                                //then print&store missing left
-
-                                /*matching.iter()
-                                    .filter(|&(_k, v)| v.side == DirSide::Right)
-                                    .for_each(|(_k, v)| { println!("missing left: {}", v.path.display()) });
-
-                                //then print&store missing right
-                                matching.iter()
-                                    .filter(|&(_k, v)| v.side == DirSide::Left)
-                                    .for_each(|(_k, v)| { println!("missing right: {}", v.path.display()) });
-
-                                */
                                 println!("finished processing");
                             }
                             break;
